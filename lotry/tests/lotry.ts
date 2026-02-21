@@ -19,25 +19,19 @@ describe("lotry", () => {
   anchor.setProvider(provider);
 
   const program = anchor.workspace.Lotry as Program<Lotry>;
+  const epochId = new BN(9); // bump if Devnet complains about reused PDAs
 
   // Ensure the test wallet has funds on devnet L1
   // (Verified manually via debug script: 8.41 SOL)
+  //   before(async () => {
+  // ... skipping balance check
+  //   });
+
   /*
-  before(async () => {
-    const bal = await l1Connection.getBalance(wallet.publicKey);
-    if (bal < anchor.web3.LAMPORTS_PER_SOL) {
-      const sig = await l1Connection.requestAirdrop(
-        wallet.publicKey,
-        2 * anchor.web3.LAMPORTS_PER_SOL
-      );
-      await l1Connection.confirmTransaction(sig, "confirmed");
-    }
-  });
+   * Phase 1: Initialize the Lottery Pool on Devnet L1
   */
 
   it("Phase 1: Initialize Lottery Pool (Devnet)", async () => {
-    const epochId = new BN(8); // Increment to avoid already-in-use error on Devnet
-
     const [poolPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("lottery_pool"), epochId.toArrayLike(Buffer, "le", 8)],
       program.programId
@@ -51,12 +45,10 @@ describe("lotry", () => {
       .rpc();
 
     const poolState = await program.account.lotteryPool.fetch(poolPda);
-    expect(poolState.epochId.toNumber()).to.equal(8);
+    expect(poolState.epochId.toNumber()).to.equal(9);
   });
 
   it("Phase 2: Delegate Lottery Pool to ER (Devnet)", async () => {
-    const epochId = new BN(8);
-
     const [poolPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("lottery_pool"), epochId.toArrayLike(Buffer, "le", 8)],
       program.programId
@@ -84,41 +76,53 @@ describe("lotry", () => {
       DELEGATION_PROGRAM_ID
     );
 
-    const accounts: any = {
-      lotteryPool: poolPda,
-      authority: provider.wallet.publicKey,
-      validator: TEE_VALIDATOR,
-      bufferLotteryPool: bufferPda,
-      delegationRecordLotteryPool: delegationRecordPda,
-      delegationMetadataLotteryPool: delegationMetadataPda,
-      delegationProgram: DELEGATION_PROGRAM_ID,
-      ownerProgram: program.programId,
-      systemProgram: anchor.web3.SystemProgram.programId,
-    };
+    await program.methods
+      .delegateLottery(epochId)
+      .accounts({
+        lotteryPool: poolPda,
+        authority: provider.wallet.publicKey,
+        validator: TEE_VALIDATOR,
+        bufferLotteryPool: bufferPda,
+        delegationRecordLotteryPool: delegationRecordPda,
+        delegationMetadataLotteryPool: delegationMetadataPda,
+        delegationProgram: DELEGATION_PROGRAM_ID,
+        ownerProgram: program.programId,
+        systemProgram: anchor.web3.SystemProgram.programId,
+      })
+      // Use sendAndConfirmTransaction because .rpc() throws a cryptic error in the Anchor client
+      // for this specific CPI setup
+      .transaction()
+      .then(async (tx) => {
+        tx.recentBlockhash = (await l1Connection.getLatestBlockhash()).blockhash;
+        tx.feePayer = wallet.publicKey;
+        return await anchor.web3.sendAndConfirmTransaction(l1Connection, tx, [(wallet as any).payer ?? wallet]);
+      });
 
-    try {
-      // Manual transaction to bypass .rpc() issue
-      const tx = await program.methods
-        .delegateLottery(epochId)
-        .accounts(accounts)
-        .transaction();
-
-      const sig = await anchor.web3.sendAndConfirmTransaction(
-        l1Connection,
-        tx,
-        [(wallet as any).payer ?? wallet] // Support different wallet structures
-      );
-      console.log("Delegation Sig:", sig);
-    } catch (err: any) {
-      if (err.logs) {
-        console.log("Transaction Logs:", err.logs);
-      }
-      throw err;
-    }
-
-    // Verify ownership has changed to the delegation program
+    // Verification: Re-fetch the account info and check the owner has changed to DELEGATION_PROGRAM_ID
     const poolAccountInfo = await l1Connection.getAccountInfo(poolPda);
     expect(poolAccountInfo?.owner.toBase58()).to.equal(DELEGATION_PROGRAM_ID.toBase58());
   });
-});
 
+  it("Phase 3: Issue Session Key (Devnet)", async () => {
+    const ephemeral = Keypair.generate();
+    const validUntil = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
+
+    const [sessionPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("session"), wallet.publicKey.toBuffer(), ephemeral.publicKey.toBuffer()],
+      program.programId
+    );
+
+    await program.methods
+      .issueSession(ephemeral.publicKey, new BN(validUntil))
+      .accounts({
+        sessionToken: sessionPda,
+        authority: provider.wallet.publicKey,
+      })
+      .rpc();
+
+    const sessionState = await program.account.sessionToken.fetch(sessionPda);
+    expect(sessionState.authority.toBase58()).to.equal(provider.wallet.publicKey.toBase58());
+    expect(sessionState.ephemeralKey.toBase58()).to.equal(ephemeral.publicKey.toBase58());
+    expect(sessionState.validUntil.toNumber()).to.be.closeTo(validUntil, 5);
+  });
+});
