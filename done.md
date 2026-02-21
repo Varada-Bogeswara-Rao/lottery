@@ -1,52 +1,57 @@
 # MagicBlock Shielded Micro-Lotteries: Development Progress 
 
 ## Context for the Next Agent
-You are picking up the development from Phase 3. We are building a shielded micro-lottery application on Solana using the **MagicBlock Ephemeral Rollups (ER) SDK**. Do **NOT** use the Bolt ECS framework/macros for this; we are using standard Anchor programs annotated with `#[ephemeral]`, `#[delegate]`, etc. from the `ephemeral-rollups-sdk` (v0.6.5).
+You are picking up the development from **Phase 4: BuyTicket (TEE Execution)**. We are building a shielded micro-lottery application on Solana using the **MagicBlock Ephemeral Rollups (ER) SDK**. Do **NOT** use the Bolt ECS framework/macros for this; we are using standard Anchor programs annotated with `#[ephemeral]`, `#[delegate]`, etc. from the `ephemeral-rollups-sdk` (v0.6.5).
 
 The current workspace is an Anchor project located at `/home/bunny/Lotry/lotry`.
 
 ---
 
-## 🟢 What is DONE (Phase 1 & Phase 2)
+## 🟢 What is DONE (Phases 1, 2, & 3)
 
 ### Phase 1: Core State & Initialization
 - **State Accounts:** Defined `LotteryPool`, `PlayerTicket`, and `SessionToken` structs in `programs/lotry/src/lib.rs`.
 - **Initialization:** Implemented the `initialize_lottery` instruction to allocate the `LotteryPool` PDA on L1.
-- **Testing (`tests/lotry.ts`):** Phase 1 integration tests successfully pass on the MagicBlock Devnet RPC (`https://rpc.magicblock.app/devnet/`). *Note: We incrementally change the `epochId` variable in `tests/lotry.ts` manually to avoid "account already in use" errors during back-to-back devnet test runs.*
 
 ### Phase 2: Delegation to Ephemeral Rollup
-- **Instruction:** Implemented `delegate_lottery` using the `ephemeral-rollups-sdk`. This instruction bundles the `LotteryPool` account to a MagicBlock TEE Validator (`FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA`).
-- **Debugging Victory:** We successfully resolved a `PrivilegeEscalation` (unauthorized signer) CPI error. This bug was caused by a mismatch in PDA derivations between our TS tests and the SDK's internal delegation macro.
-- **Actionable Insight:** The MagicBlock Delegation logic uses very specific string tags to derive internal PDAs. Our `lotry.ts` test now perfectly mimics this. For future reference, the tags used internally by the SDK are:
-  - Buffer PDA Tag: `b"buffer"`
-  - Delegation Record Tag: `b"delegation"`
-  - Delegation Metadata Tag: `b"delegation-metadata"`
-- **Testing:** Phase 2 tests successfully pass on Devnet! The `LotteryPool` account transfers correctly to the MagicBlock Delegation Program.
+- **Instruction:** Implemented `delegate_lottery` using the `ephemeral-rollups-sdk`. This bundles the `LotteryPool` account to a MagicBlock TEE Validator (`FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA`).
+- **Internal PDAs:** Successfully derived and passed the required internal Delegation Program PDAs using tags `b"buffer"`, `b"delegation"`, and `b"delegation-metadata"`.
+
+### Phase 3: Session Key Issuance
+- **Instruction:** Implemented `issue_session` properly on L1.
+- **Testing:** Phase 3 passes perfectly! The script properly generated a session PDA containing a 1-hour expiration timestamp and an `ephemeral_key` authority.
+
+*Note: We have been incrementally changing the `epochId` variable in `tests/lotry.ts` manually to avoid "account already in use" errors during back-to-back Devnet test runs.*
 
 ---
 
-## 🟡 What needs to be done NEXT (Phase 3)
+## 🟡 What needs to be done NEXT (Phase 4)
 
-Your immediate goal is to implement and test **Phase 3: Session Key Issuance**.
+Your immediate goal is to implement and test **Phase 4: BuyTicket (TEE Execution)**. This step is critical because it runs inside the Ephemeral Rollup (ER) rather than L1.
 
 ### 1. Smart Contract Implementation (`programs/lotry/src/lib.rs`)
-- Add the `issue_session` Anchor context and instruction handler.
-- **Purpose:** Initialize a `SessionToken` PDA on L1. This secondary keypair will be used to approve gasless, automated ticket purchases on the ER layer later in Phase 4.
-- **Seeds for SessionToken PDA:** `[b"session", authority.key().as_ref(), ephemeral_key.as_ref()]`.
-- **Fields Expected in `SessionToken`:** 
-  - `authority`: Pubkey (The main L1 wallet).
-  - `ephemeral_key`: Pubkey (The temporary keypair for the ER layer).
-  - `valid_until`: i64 (Expiration timestamp, e.g., `Clock::get()?.unix_timestamp + 3600` for 1 hour).
-- **Authorization:** This instruction must be signed by the main `authority` wallet over L1.
+- Add the `buy_ticket` Anchor context and instruction handler.
+- **Logic Required:**
+  - Validate that the signer is the `ephemeral_key` stored in the `SessionToken` PDA. Throw `LottryError::InvalidSessionSigner` if not.
+  - Validate that the `SessionToken` has not expired (`valid_until > Clock::get()?.unix_timestamp`). Throw `LottryError::SessionExpired` if expired.
+  - Validate that the `LotteryPool` is `is_active` and the `epoch_id` matches.
+  - **Action:** Increment `LotteryPool.ticket_count` by 1.
+  - **Action:** Initialize a new `PlayerTicket` PDA. 
+    - Seeds: `[b"ticket", lottery_pool.key().as_ref(), pool.ticket_count.to_le_bytes().as_ref()]`.
+    - Fields: Set `owner` to the original L1 `authority` from the session token, set `ticket_data` to a hashed 32-byte guess, and set `ticket_id` to the current `ticket_count`.
+- **Important:** Do *not* include a `system_program::transfer` for a ticket fee inside this handler. ER transactions are gasless and cannot perform cross-program invocations to move real L1 SOL while delegated. The fee logic defaults to 0 for this test phase.
 
 ### 2. TypeScript Integration Test (`tests/lotry.ts`)
-- Add a new Mocha `it()` block: `"Phase 3: Issue Session Key (Devnet)"`.
-- Generate a new `Keypair` inside the test to act as the `ephemeral_key`.
-- Derive the `SessionToken` PDA using the exact seeds mentioned above.
-- Call the `issue_session` contract method via `program.methods.issueSession(...).accounts(...).rpc()`.
-- Fetch the `SessionToken` PDA's data and assert that the `valid_until` timestamp was written correctly to prove successful initialization.
+- Add a new Mocha `it()` block: `"Phase 4: Buy Ticket on ER Validator (TEE)"`.
+- **CRITICAL - RPC Routing:** For this transaction, you MUST send the transaction to the Ephemeral Rollup RPC validator, *NOT* L1 Devnet. 
+  - ER RPC URL: `https://tee.magicblock.app`
+  - Create a new `Connection` and new `AnchorProvider` pointing to this ER URL. instantiate a secondary `erProgram` handle using this provider.
+- Derive the `PlayerTicket` PDA using the ticket counter (guess `0` for the first ticket).
+- **CRITICAL - Signers:** Send the `buyTicket` transaction using *only* the `ephemeral` `Keypair` from Phase 3 as the signer. Do not sign with the main wallet. (Gasless!)
+- Use `.rpc()` via the `erProgram` handle to dispatch the transaction.
+- After the transaction settles, fetch the `LotteryPool` *from the ER RPC* and assert `ticket_count === 1`. 
 
-### Instructions & Rules of Thumb for You:
-1. **RPC Usage:** Use `ANCHOR_PROVIDER_URL=https://rpc.magicblock.app/devnet/` for L1 L1 test operations. 
-2. **Epoch IDs:** If you get "account already in use" errors during devnet testing, increment the `epochId` in `tests/lotry.ts` (currently it's on `8`).
-3. **Execution Context:** Keep adding onto `programs/lotry/src/lib.rs` and `tests/lotry.ts`. Do not over-complicate the testing environment—manual integration tests against the live L1 Devnet are working perfectly.
+### Summary Steps for You (Codex):
+1. Write the `buy_ticket` Anchor handler in `lib.rs`.
+2. Write the Phase 4 automated test in `lotry.ts`.
+3. Test locally using `ANCHOR_PROVIDER_URL=https://rpc.magicblock.app/devnet/ yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts`

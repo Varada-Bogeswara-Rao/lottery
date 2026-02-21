@@ -1,16 +1,17 @@
 [toolchain]
+anchor_version = "0.32.1"
 
 [features]
 resolution = true
 skip-lint = false
 
 [programs.localnet]
-lotry = "8EfoffNAfiKmbLZYJ6N6YvF7PmRmrfJHoPzGH5jh5jvW"
+lotry = "6uuK1kSc5UtnDy7MzhztXQ5fPz3LA6GLwFxxTUvQzC6L"
 movement = "F9P3gGs42VuxwgpQG1oLpavHKHDgV957zXsCA5tQsL2H"
 position = "G9YwsCxvxPsA3ofqQ4iapfPQshueoeHnYgz1QJUKNGej"
 
 [programs.devnet]
-lotry = "8EfoffNAfiKmbLZYJ6N6YvF7PmRmrfJHoPzGH5jh5jvW"
+lotry = "6uuK1kSc5UtnDy7MzhztXQ5fPz3LA6GLwFxxTUvQzC6L"
 movement = "F9P3gGs42VuxwgpQG1oLpavHKHDgV957zXsCA5tQsL2H"
 position = "G9YwsCxvxPsA3ofqQ4iapfPQshueoeHnYgz1QJUKNGej"
 

@@ -7,7 +7,7 @@ use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRando
 use ephemeral_vrf_sdk::types::SerializableAccountMeta;
 use std::str::FromStr;
 
-declare_id!("8EfoffNAfiKmbLZYJ6N6YvF7PmRmrfJHoPzGH5jh5jvW");
+declare_id!("6uuK1kSc5UtnDy7MzhztXQ5fPz3LA6GLwFxxTUvQzC6L");
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Seeds
@@ -21,11 +21,12 @@ pub const SESSION_SEED: &[u8] = b"session";
 // ──────────────────────────────────────────────────────────────────────────────
 // TEE validator: tee.magicblock.app
 pub const TEE_VALIDATOR: &str = "FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA";
+pub const DELEGATION_PROGRAM_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Program
 // ──────────────────────────────────────────────────────────────────────────────
-#[ephemeral]
+#[ephemeral_rollups_sdk::anchor::ephemeral]
 #[program]
 pub mod lotry {
     use super::*;
@@ -115,17 +116,68 @@ pub mod lotry {
         Ok(())
     }
 
-    // ── Phase 4 ───────────────────────────────────────────────────────────────
+    // ── Phase 4: ER Ticket Purchase ──────────────────────────────────────────
 
-    /// Buy a ticket. Runs in the Ephemeral Rollup / TEE.
+    /// Pre-allocates the PlayerTicket on L1 so the ER doesn't have to CPI to SystemProgram
+    pub fn init_player_ticket(
+        ctx: Context<InitPlayerTicket>,
+        _epoch_id: u64,
+        _ticket_count: u64,
+    ) -> Result<()> {
+        msg!("PlayerTicket pre-allocated on L1");
+        Ok(())
+    }
+
+    /// Delegates the pre-allocated PlayerTicket to the ER
+    pub fn delegate_player_ticket(
+        ctx: Context<DelegatePlayerTicket>,
+        epoch_id: u64,
+        ticket_count: u64,
+    ) -> Result<()> {
+        let pda_signer_seeds: &[&[u8]] = &[
+            PLAYER_TICKET_SEED,
+            &epoch_id.to_le_bytes(),
+            &ticket_count.to_le_bytes(),
+        ];
+
+        let delegate_config = ephemeral_rollups_sdk::cpi::DelegateConfig {
+            validator: ctx.accounts.validator.as_ref().map(|v| *v.key),
+            ..Default::default()
+        };
+
+        let delegate_accounts = ephemeral_rollups_sdk::cpi::DelegateAccounts {
+            payer: &ctx.accounts.fee_payer.to_account_info(),
+            pda: &ctx.accounts.player_ticket.to_account_info(),
+            owner_program: &ctx.accounts.owner_program,
+            buffer: &ctx.accounts.buffer_player_ticket,
+            delegation_record: &ctx.accounts.delegation_record,
+            delegation_metadata: &ctx.accounts.delegation_metadata,
+            delegation_program: &ctx.accounts.ephemeral_rollups_program,
+            system_program: &ctx.accounts.system_program.to_account_info(),
+        };
+
+        ephemeral_rollups_sdk::cpi::delegate_account(
+            delegate_accounts,
+            pda_signer_seeds,
+            delegate_config,
+        )?;
+
+        msg!("PlayerTicket delegated to ER");
+        Ok(())
+    }
+
+    /// Executed on the Ephemeral Rollup (ER). Uses pre-allocated L1 PlayerTicket.
     /// Signed only by the ephemeral session key — no SOL transfer (gasless on ER).
     pub fn buy_ticket(
         ctx: Context<BuyTicket>,
         epoch_id: u64,
+        ticket_count: u64,
         ticket_data: [u8; 32],
     ) -> Result<()> {
-        // Validate session token
+        // Validate session token (standard Anchor accounts, ER remaps ownership)
         let session = &ctx.accounts.session_token;
+
+        // Validate signer and expiry
         require!(
             session.ephemeral_key == ctx.accounts.ephemeral_signer.key(),
             LottryError::InvalidSessionSigner
@@ -134,25 +186,33 @@ pub mod lotry {
             Clock::get()?.unix_timestamp < session.valid_until,
             LottryError::SessionExpired
         );
+        require_keys_eq!(
+            session.authority,
+            ctx.accounts.authority.key(),
+            LottryError::InvalidSessionSigner
+        );
 
-        // Validate pool
+        // Access pool and ticket directly (Anchor will remap ownership on ER)
         let pool = &mut ctx.accounts.lottery_pool;
+
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.epoch_id == epoch_id, LottryError::EpochMismatch);
+        require!(ticket_count == pool.ticket_count, LottryError::EpochMismatch);
 
-        // Record ticket
+        // Update ticket
         let ticket = &mut ctx.accounts.player_ticket;
         ticket.owner = session.authority;
         ticket.epoch_id = epoch_id;
+        ticket.ticket_id = ticket_count;
         ticket.ticket_data = ticket_data;
-        ticket.ticket_id = pool.ticket_count;
 
-        pool.ticket_count += 1;
+        // Update pool counter
+        pool.ticket_count = pool.ticket_count.saturating_add(1);
 
         msg!(
             "Ticket #{} issued to {} in epoch {}",
-            ticket.ticket_id,
-            ticket.owner,
+            ticket_count,
+            session.authority,
             epoch_id
         );
         Ok(())
@@ -166,7 +226,14 @@ pub mod lotry {
         epoch_id: u64,
         client_seed: u8,
     ) -> Result<()> {
-        let pool = &ctx.accounts.lottery_pool;
+        let pool_info = &ctx.accounts.lottery_pool;
+        let pool: LotteryPool = {
+            let data = pool_info.try_borrow_data()?;
+            if data.len() < 8 { return Err(anchor_lang::error::ErrorCode::AccountDidNotDeserialize.into()); }
+            let mut data_ptr = &data[8..];
+            LotteryPool::deserialize(&mut data_ptr)?
+        };
+
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.ticket_count > 0, LottryError::NoTickets);
 
@@ -178,7 +245,7 @@ pub mod lotry {
             caller_seed: [client_seed; 32],
             accounts_metas: Some(vec![
                 SerializableAccountMeta {
-                    pubkey: ctx.accounts.lottery_pool.key(),
+                    pubkey: pool_info.key(),
                     is_signer: false,
                     is_writable: true,
                 },
@@ -203,7 +270,6 @@ pub mod lotry {
 
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.ticket_count > 0, LottryError::NoTickets);
-
         // Derive winner ticket id in range [0, ticket_count)
         let winner_id = ephemeral_vrf_sdk::rnd::random_u8_with_range(
             &randomness,
@@ -373,35 +439,73 @@ pub struct IssueSession<'info> {
 // ── Phase 4 ──────────────────────────────────────────────────────────────────
 
 #[derive(Accounts)]
-#[instruction(epoch_id: u64, ticket_data: [u8; 32])]
-pub struct BuyTicket<'info> {
-    #[account(
-        mut,
-        seeds = [LOTTERY_POOL_SEED, &epoch_id.to_le_bytes()],
-        bump
-    )]
-    pub lottery_pool: Account<'info, LotteryPool>,
+#[instruction(epoch_id: u64, ticket_count: u64)]
+pub struct InitPlayerTicket<'info> {
     #[account(
         init,
         payer = fee_payer,
         space = PlayerTicket::LEN,
-        seeds = [
-            PLAYER_TICKET_SEED,
-            &epoch_id.to_le_bytes(),
-            &lottery_pool.ticket_count.to_le_bytes()
-        ],
+        seeds = [PLAYER_TICKET_SEED, &epoch_id.to_le_bytes(), &ticket_count.to_le_bytes()],
         bump
     )]
     pub player_ticket: Account<'info, PlayerTicket>,
-    /// SessionToken PDA — ephemeral_key validated against ephemeral_signer
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(epoch_id: u64, ticket_count: u64)]
+pub struct DelegatePlayerTicket<'info> {
     #[account(
-        seeds = [SESSION_SEED, session_token.authority.as_ref(), ephemeral_signer.key().as_ref()],
+        mut,
+        seeds = [PLAYER_TICKET_SEED, &epoch_id.to_le_bytes(), &ticket_count.to_le_bytes()],
         bump
     )]
+    pub player_ticket: Account<'info, PlayerTicket>,
+    
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+
+    /// CHECK: Checked by the delegate program — target ER validator
+    pub validator: Option<AccountInfo<'info>>,
+
+    /// CHECK: The buffer account - created via CPI
+    #[account(mut)]
+    pub buffer_player_ticket: AccountInfo<'info>,
+
+    /// CHECK: The delegation record account - created via CPI
+    #[account(mut)]
+    pub delegation_record: AccountInfo<'info>,
+
+    /// CHECK: The delegation metadata account - created via CPI
+    #[account(mut)]
+    pub delegation_metadata: AccountInfo<'info>,
+
+    /// CHECK: Passed to the CPI
+    #[account(address = ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID)]
+    pub ephemeral_rollups_program: AccountInfo<'info>,
+
+    /// CHECK: The owner program
+    #[account(address = crate::id())]
+    pub owner_program: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[ephemeral_rollups_sdk::anchor::action]
+#[derive(Accounts)]
+#[instruction(epoch_id: u64, ticket_count: u64, ticket_data: [u8; 32])]
+pub struct BuyTicket<'info> {
+    #[account(mut)]
+    pub lottery_pool: Account<'info, LotteryPool>,
+    #[account(mut)]
+    pub player_ticket: Account<'info, PlayerTicket>,
+    /// CHECK:
+    pub authority: UncheckedAccount<'info>,
+    #[account(mut)]
     pub session_token: Account<'info, SessionToken>,
-    /// The session keypair — must be a signer of this transaction
     pub ephemeral_signer: Signer<'info>,
-    /// Fee payer on ER (can be a relayer for gasless UX)
     #[account(mut)]
     pub fee_payer: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -410,6 +514,7 @@ pub struct BuyTicket<'info> {
 // ── Phase 5 ──────────────────────────────────────────────────────────────────
 
 #[vrf]
+#[ephemeral_rollups_sdk::anchor::action]
 #[derive(Accounts)]
 #[instruction(epoch_id: u64)]
 pub struct RequestWinner<'info> {
@@ -418,7 +523,8 @@ pub struct RequestWinner<'info> {
         seeds = [LOTTERY_POOL_SEED, &epoch_id.to_le_bytes()],
         bump
     )]
-    pub lottery_pool: Account<'info, LotteryPool>,
+    /// CHECK: Manually deserialized to bypass ownership check on ER
+    pub lottery_pool: UncheckedAccount<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
     /// CHECK: oracle queue
