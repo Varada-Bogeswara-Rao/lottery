@@ -1,11 +1,11 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
-use ephemeral_rollups_sdk::cpi::DelegateConfig;
+use ephemeral_rollups_sdk::cpi::{delegate_account, DelegateAccounts, DelegateConfig};
 use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
-// VRF SDK imports — enabled in Phase 5
-// use ephemeral_vrf_sdk::anchor::vrf;
-// use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
-// use ephemeral_vrf_sdk::types::SerializableAccountMeta;
+use ephemeral_vrf_sdk::anchor::vrf;
+use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
+use ephemeral_vrf_sdk::types::SerializableAccountMeta;
+use std::str::FromStr;
 
 declare_id!("8EfoffNAfiKmbLZYJ6N6YvF7PmRmrfJHoPzGH5jh5jvW");
 
@@ -46,28 +46,47 @@ pub mod lotry {
         Ok(())
     }
 
+
     // ── Phase 2 ───────────────────────────────────────────────────────────────
 
-    /// Delegate LotteryPool to the Ephemeral Rollup (TEE validator).
-    pub fn delegate_pool(ctx: Context<DelegatePool>, epoch_id: u64) -> Result<()> {
-        let validator: Option<Pubkey> = ctx
-            .accounts
-            .validator
-            .as_ref()
-            .map(|v| v.key());
+    /// Delegate the lottery pool to the Ephemeral Rollup validator.
+    pub fn delegate_lottery(ctx: Context<DelegateLottery>, epoch_id: u64) -> Result<()> {
+        let epoch_bytes = epoch_id.to_le_bytes();
+        let seeds = &[
+            LOTTERY_POOL_SEED,
+            &epoch_bytes[..],
+        ];
+        msg!("Current Program ID: {:?}", crate::id());
+        let (derived_pda, derived_bump) = Pubkey::find_program_address(seeds, &crate::id());
+        msg!("Manual Derived PDA: {:?} bump: {}", derived_pda, derived_bump);
 
-        ctx.accounts.delegate_lottery_pool(
-            &ctx.accounts.authority,
-            &[
-                LOTTERY_POOL_SEED,
-                &epoch_id.to_le_bytes(),
-            ],
-            DelegateConfig {
-                validator,
-                ..Default::default()
+        msg!("Delegating pool: {:?}", ctx.accounts.lottery_pool.key());
+        msg!("Seeds: {:?} {:?}", LOTTERY_POOL_SEED, epoch_bytes);
+        
+        // Ensure we are delegating to the specific TEE validator we configured
+        // in our implementation plan: FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA
+        let delegate_config = DelegateConfig {
+            validator: Some(Pubkey::from_str(TEE_VALIDATOR).map_err(|_| LottryError::InvalidValidator)?),
+            ..Default::default()
+        };
+
+        // Delegate the account to ER manually
+        delegate_account(
+            DelegateAccounts {
+                payer: &ctx.accounts.authority.to_account_info(),
+                pda: &ctx.accounts.lottery_pool.to_account_info(),
+                owner_program: &ctx.accounts.owner_program.to_account_info(), 
+                buffer: &ctx.accounts.buffer_lottery_pool.to_account_info(),
+                delegation_record: &ctx.accounts.delegation_record_lottery_pool.to_account_info(),
+                delegation_metadata: &ctx.accounts.delegation_metadata_lottery_pool.to_account_info(),
+                delegation_program: &ctx.accounts.delegation_program.to_account_info(), 
+                system_program: &ctx.accounts.system_program.to_account_info(),
             },
+            seeds,
+            delegate_config,
         )?;
-        msg!("LotteryPool epoch {} delegated to ER", epoch_id);
+
+        msg!("Lottery pool for epoch {} delegated to ER", epoch_id);
         Ok(())
     }
 
@@ -142,34 +161,55 @@ pub mod lotry {
     // ── Phase 5 ───────────────────────────────────────────────────────────────
 
     /// Request a VRF winner. Runs on ER. Sends CPI to VRF oracle.
-    /// TODO Phase 5: re-enable ephemeral-vrf-sdk and implement VRF CPI.
     pub fn request_winner(
         ctx: Context<RequestWinner>,
         epoch_id: u64,
-        _client_seed: u8,
+        client_seed: u8,
     ) -> Result<()> {
         let pool = &ctx.accounts.lottery_pool;
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.ticket_count > 0, LottryError::NoTickets);
-        msg!("VRF randomness requested for epoch {} (stub)", epoch_id);
+
+        let ix = create_request_randomness_ix(RequestRandomnessParams {
+            payer: ctx.accounts.payer.key(),
+            oracle_queue: ctx.accounts.oracle_queue.key(),
+            callback_program_id: crate::ID,
+            callback_discriminator: instruction::ConsumeRandomness::DISCRIMINATOR.to_vec(),
+            caller_seed: [client_seed; 32],
+            accounts_metas: Some(vec![
+                SerializableAccountMeta {
+                    pubkey: ctx.accounts.lottery_pool.key(),
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ]),
+            ..Default::default()
+        });
+
+        ctx.accounts
+            .invoke_signed_vrf(&ctx.accounts.payer.to_account_info(), &ix)?;
+
+        msg!("VRF randomness requested for epoch {}", epoch_id);
         Ok(())
     }
 
     /// VRF callback — invoked by the VRF oracle program via CPI.
-    /// TODO Phase 5: validate VRF_PROGRAM_IDENTITY signer and derive winner.
+    /// Access-controlled: only the VRF program identity PDA can call this.
     pub fn consume_randomness(
         ctx: Context<ConsumeRandomness>,
         randomness: [u8; 32],
     ) -> Result<()> {
         let pool = &mut ctx.accounts.lottery_pool;
+
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.ticket_count > 0, LottryError::NoTickets);
 
-        // Simple modulo winner selection (Phase 5 will use ephemeral_vrf_sdk::rnd)
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&randomness[..8]);
-        let rnd = u64::from_le_bytes(bytes);
-        let winner_id = rnd % pool.ticket_count;
+        // Derive winner ticket id in range [0, ticket_count)
+        let winner_id = ephemeral_vrf_sdk::rnd::random_u8_with_range(
+            &randomness,
+            0,
+            pool.ticket_count.saturating_sub(1) as u8,
+        ) as u64;
 
         pool.winner_ticket_id = Some(winner_id);
         pool.is_active = false;
@@ -272,21 +312,44 @@ pub struct InitializeLottery<'info> {
 
 // ── Phase 2 ──────────────────────────────────────────────────────────────────
 
-#[delegate]
 #[derive(Accounts)]
 #[instruction(epoch_id: u64)]
-pub struct DelegatePool<'info> {
+pub struct DelegateLottery<'info> {
     #[account(
         mut,
         seeds = [LOTTERY_POOL_SEED, &epoch_id.to_le_bytes()],
         bump,
-        del
     )]
-    pub lottery_pool: AccountInfo<'info>,
+    /// CHECK: delegating pda
+    pub lottery_pool: Account<'info, LotteryPool>,
+    
     #[account(mut)]
     pub authority: Signer<'info>,
+
     /// CHECK: Checked by the delegate program — target ER validator
     pub validator: Option<AccountInfo<'info>>,
+
+    /// CHECK: The buffer account - created via CPI
+    #[account(mut)]
+    pub buffer_lottery_pool: AccountInfo<'info>,
+
+    /// CHECK: The delegation record account - created via CPI
+    #[account(mut)]
+    pub delegation_record_lottery_pool: AccountInfo<'info>,
+
+    /// CHECK: The delegation metadata account - created via CPI
+    #[account(mut)]
+    pub delegation_metadata_lottery_pool: AccountInfo<'info>,
+
+    /// CHECK: The delegation program
+    #[account(address = ephemeral_rollups_sdk::id())]
+    pub delegation_program: AccountInfo<'info>,
+
+    /// CHECK: The owner program
+    #[account(address = crate::id())]
+    pub owner_program: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 // ── Phase 3 ──────────────────────────────────────────────────────────────────
@@ -346,7 +409,7 @@ pub struct BuyTicket<'info> {
 
 // ── Phase 5 ──────────────────────────────────────────────────────────────────
 
-// TODO Phase 5: add #[vrf] macro once ephemeral-vrf-sdk build issue is resolved
+#[vrf]
 #[derive(Accounts)]
 #[instruction(epoch_id: u64)]
 pub struct RequestWinner<'info> {
@@ -358,14 +421,15 @@ pub struct RequestWinner<'info> {
     pub lottery_pool: Account<'info, LotteryPool>,
     #[account(mut)]
     pub payer: Signer<'info>,
-    /// CHECK: Placeholder oracle queue — will bind to DEFAULT_QUEUE in Phase 5
-    #[account(mut)]
+    /// CHECK: oracle queue
+    #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_QUEUE)]
     pub oracle_queue: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
 pub struct ConsumeRandomness<'info> {
-    /// CHECK: Will be constrained to VRF_PROGRAM_IDENTITY in Phase 5
+    /// The VRF program identity PDA — enforces only the VRF oracle can call this
+    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
     pub vrf_program_identity: Signer<'info>,
     #[account(mut)]
     pub lottery_pool: Account<'info, LotteryPool>,
@@ -408,4 +472,6 @@ pub enum LottryError {
     InvalidExpiry,
     #[msg("No tickets in this epoch — cannot request winner.")]
     NoTickets,
+    #[msg("Validator pubkey is invalid.")]
+    InvalidValidator,
 }

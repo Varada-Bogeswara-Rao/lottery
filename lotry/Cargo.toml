@@ -1,13 +1,13 @@
 [workspace]
 members = [
     "programs/*",
-    "programs-ecs/components/*",
-    "programs-ecs/systems/*"
 ]
 resolver = "2"
 
 [workspace.dependencies]
-bolt-lang = "0.2.4"
+bolt-lang = "=0.2.4"
+session-keys = "=2.0.4"
+ephemeral-rollups-sdk = "=0.6.5"
 
 [profile.release]
 overflow-checks = true
