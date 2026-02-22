@@ -1,11 +1,7 @@
 use anchor_lang::prelude::*;
-use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::anchor::commit;
 use ephemeral_rollups_sdk::cpi::{delegate_account, DelegateAccounts, DelegateConfig};
 use ephemeral_rollups_sdk::ephem::commit_and_undelegate_accounts;
-use ephemeral_vrf_sdk::anchor::vrf;
-use ephemeral_vrf_sdk::instructions::{create_request_randomness_ix, RequestRandomnessParams};
-use ephemeral_vrf_sdk::types::SerializableAccountMeta;
-use std::str::FromStr;
 
 declare_id!("6uuK1kSc5UtnDy7MzhztXQ5fPz3LA6GLwFxxTUvQzC6L");
 
@@ -20,7 +16,7 @@ pub const SESSION_SEED: &[u8] = b"session";
 // TEE / ER validator pubkeys
 // ──────────────────────────────────────────────────────────────────────────────
 // TEE validator: tee.magicblock.app
-pub const TEE_VALIDATOR: &str = "FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA";
+pub const TEE_VALIDATOR: &str = "MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57";
 pub const DELEGATION_PROGRAM_ID: &str = "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh";
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -64,10 +60,9 @@ pub mod lotry {
         msg!("Delegating pool: {:?}", ctx.accounts.lottery_pool.key());
         msg!("Seeds: {:?} {:?}", LOTTERY_POOL_SEED, epoch_bytes);
         
-        // Ensure we are delegating to the specific TEE validator we configured
-        // in our implementation plan: FnE6VJT5QNZdedZPnCoLsARgBwoE6DeJNjBs2H1gySXA
+        // Use the dynamically provided validator account
         let delegate_config = DelegateConfig {
-            validator: Some(Pubkey::from_str(TEE_VALIDATOR).map_err(|_| LottryError::InvalidValidator)?),
+            validator: ctx.accounts.validator.as_ref().map(|v| *v.key),
             ..Default::default()
         };
 
@@ -192,21 +187,18 @@ pub mod lotry {
             LottryError::InvalidSessionSigner
         );
 
-        // Access pool and ticket directly (Anchor will remap ownership on ER)
         let pool = &mut ctx.accounts.lottery_pool;
+        let ticket = &mut ctx.accounts.player_ticket;
 
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.epoch_id == epoch_id, LottryError::EpochMismatch);
         require!(ticket_count == pool.ticket_count, LottryError::EpochMismatch);
 
-        // Update ticket
-        let ticket = &mut ctx.accounts.player_ticket;
         ticket.owner = session.authority;
         ticket.epoch_id = epoch_id;
         ticket.ticket_id = ticket_count;
         ticket.ticket_data = ticket_data;
 
-        // Update pool counter
         pool.ticket_count = pool.ticket_count.saturating_add(1);
 
         msg!(
@@ -220,62 +212,36 @@ pub mod lotry {
 
     // ── Phase 5 ───────────────────────────────────────────────────────────────
 
-    /// Request a VRF winner. Runs on ER. Sends CPI to VRF oracle.
+    /// Simple timestamp-based winner selection. Runs on ER with session key auth.
     pub fn request_winner(
         ctx: Context<RequestWinner>,
         epoch_id: u64,
         client_seed: u8,
     ) -> Result<()> {
-        let pool_info = &ctx.accounts.lottery_pool;
-        let pool: LotteryPool = {
-            let data = pool_info.try_borrow_data()?;
-            if data.len() < 8 { return Err(anchor_lang::error::ErrorCode::AccountDidNotDeserialize.into()); }
-            let mut data_ptr = &data[8..];
-            LotteryPool::deserialize(&mut data_ptr)?
-        };
-
-        require!(pool.is_active, LottryError::PoolNotActive);
-        require!(pool.ticket_count > 0, LottryError::NoTickets);
-
-        let ix = create_request_randomness_ix(RequestRandomnessParams {
-            payer: ctx.accounts.payer.key(),
-            oracle_queue: ctx.accounts.oracle_queue.key(),
-            callback_program_id: crate::ID,
-            callback_discriminator: instruction::ConsumeRandomness::DISCRIMINATOR.to_vec(),
-            caller_seed: [client_seed; 32],
-            accounts_metas: Some(vec![
-                SerializableAccountMeta {
-                    pubkey: pool_info.key(),
-                    is_signer: false,
-                    is_writable: true,
-                },
-            ]),
-            ..Default::default()
-        });
-
-        ctx.accounts
-            .invoke_signed_vrf(&ctx.accounts.payer.to_account_info(), &ix)?;
-
-        msg!("VRF randomness requested for epoch {}", epoch_id);
-        Ok(())
-    }
-
-    /// VRF callback — invoked by the VRF oracle program via CPI.
-    /// Access-controlled: only the VRF program identity PDA can call this.
-    pub fn consume_randomness(
-        ctx: Context<ConsumeRandomness>,
-        randomness: [u8; 32],
-    ) -> Result<()> {
         let pool = &mut ctx.accounts.lottery_pool;
+        let session = &ctx.accounts.session_token;
+
+        // Validate signer and expiry
+        require!(
+            session.ephemeral_key == ctx.accounts.ephemeral_signer.key(),
+            LottryError::InvalidSessionSigner
+        );
+        require!(
+            Clock::get()?.unix_timestamp < session.valid_until,
+            LottryError::SessionExpired
+        );
+        require_keys_eq!(
+            session.authority,
+            ctx.accounts.authority.key(),
+            LottryError::InvalidSessionSigner
+        );
 
         require!(pool.is_active, LottryError::PoolNotActive);
         require!(pool.ticket_count > 0, LottryError::NoTickets);
-        // Derive winner ticket id in range [0, ticket_count)
-        let winner_id = ephemeral_vrf_sdk::rnd::random_u8_with_range(
-            &randomness,
-            0,
-            pool.ticket_count.saturating_sub(1) as u8,
-        ) as u64;
+
+        // Pseudo-randomness using timestamp
+        let timestamp = Clock::get()?.unix_timestamp as u64;
+        let winner_id = timestamp.wrapping_add(client_seed as u64) % pool.ticket_count;
 
         pool.winner_ticket_id = Some(winner_id);
         pool.is_active = false;
@@ -408,7 +374,7 @@ pub struct DelegateLottery<'info> {
     pub delegation_metadata_lottery_pool: AccountInfo<'info>,
 
     /// CHECK: The delegation program
-    #[account(address = ephemeral_rollups_sdk::id())]
+    #[account(address = ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID)]
     pub delegation_program: AccountInfo<'info>,
 
     /// CHECK: The owner program
@@ -493,7 +459,6 @@ pub struct DelegatePlayerTicket<'info> {
     pub system_program: Program<'info, System>,
 }
 
-#[ephemeral_rollups_sdk::anchor::action]
 #[derive(Accounts)]
 #[instruction(epoch_id: u64, ticket_count: u64, ticket_data: [u8; 32])]
 pub struct BuyTicket<'info> {
@@ -503,18 +468,14 @@ pub struct BuyTicket<'info> {
     pub player_ticket: Account<'info, PlayerTicket>,
     /// CHECK:
     pub authority: UncheckedAccount<'info>,
-    #[account(mut)]
     pub session_token: Account<'info, SessionToken>,
     pub ephemeral_signer: Signer<'info>,
-    #[account(mut)]
     pub fee_payer: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 // ── Phase 5 ──────────────────────────────────────────────────────────────────
 
-#[vrf]
-#[ephemeral_rollups_sdk::anchor::action]
 #[derive(Accounts)]
 #[instruction(epoch_id: u64)]
 pub struct RequestWinner<'info> {
@@ -523,23 +484,13 @@ pub struct RequestWinner<'info> {
         seeds = [LOTTERY_POOL_SEED, &epoch_id.to_le_bytes()],
         bump
     )]
-    /// CHECK: Manually deserialized to bypass ownership check on ER
-    pub lottery_pool: UncheckedAccount<'info>,
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    /// CHECK: oracle queue
-    #[account(mut, address = ephemeral_vrf_sdk::consts::DEFAULT_QUEUE)]
-    pub oracle_queue: AccountInfo<'info>,
+    pub lottery_pool: Account<'info, LotteryPool>,
+    /// CHECK:
+    pub authority: UncheckedAccount<'info>,
+    pub session_token: Account<'info, SessionToken>,
+    pub ephemeral_signer: Signer<'info>,
 }
 
-#[derive(Accounts)]
-pub struct ConsumeRandomness<'info> {
-    /// The VRF program identity PDA — enforces only the VRF oracle can call this
-    #[account(address = ephemeral_vrf_sdk::consts::VRF_PROGRAM_IDENTITY)]
-    pub vrf_program_identity: Signer<'info>,
-    #[account(mut)]
-    pub lottery_pool: Account<'info, LotteryPool>,
-}
 
 // ── Phase 6 ──────────────────────────────────────────────────────────────────
 
@@ -553,7 +504,6 @@ pub struct UndelegatePool<'info> {
         bump
     )]
     pub lottery_pool: Account<'info, LotteryPool>,
-    #[account(mut)]
     pub payer: Signer<'info>,
     // magic_context and magic_program are injected by the #[commit] macro
 }
