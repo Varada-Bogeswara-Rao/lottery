@@ -260,9 +260,12 @@ pub mod lotry {
     pub fn undelegate_pool(ctx: Context<UndelegatePool>, _epoch_id: u64) -> Result<()> {
         require!(!ctx.accounts.lottery_pool.is_active, LottryError::PoolStillActive);
 
+        let pool_info = ctx.accounts.lottery_pool.to_account_info();
+        require!(pool_info.is_writable, LottryError::AccountNotWritable);
+
         commit_and_undelegate_accounts(
             &ctx.accounts.payer,
-            vec![&ctx.accounts.lottery_pool.to_account_info()],
+            vec![&pool_info],
             &ctx.accounts.magic_context,
             &ctx.accounts.magic_program,
         )?;
@@ -494,7 +497,7 @@ pub struct RequestWinner<'info> {
 
 // ── Phase 6 ──────────────────────────────────────────────────────────────────
 
-#[commit]
+// Removed #[commit] macro to allow explicit mutability and configurable Magic IDs 
 #[derive(Accounts)]
 #[instruction(epoch_id: u64)]
 pub struct UndelegatePool<'info> {
@@ -504,8 +507,16 @@ pub struct UndelegatePool<'info> {
         bump
     )]
     pub lottery_pool: Account<'info, LotteryPool>,
+    
+    #[account(mut)] // Payer needs to be mutable for lamport transfers during commit
     pub payer: Signer<'info>,
-    // magic_context and magic_program are injected by the #[commit] macro
+    
+    /// CHECK: Magic context must be mutable for the schedule commit invocation
+    #[account(mut)]
+    pub magic_context: AccountInfo<'info>,
+    
+    /// CHECK: Magic program executable
+    pub magic_program: AccountInfo<'info>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -530,4 +541,6 @@ pub enum LottryError {
     NoTickets,
     #[msg("Validator pubkey is invalid.")]
     InvalidValidator,
+    #[msg("Account must be writable for commit/undelegate.")]
+    AccountNotWritable,
 }

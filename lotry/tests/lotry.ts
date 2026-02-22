@@ -23,7 +23,7 @@ describe("lotry", () => {
   const erProgram = new Program(anchor.workspace.Lotry.idl, erProvider) as Program<Lotry>;
 
   // Hardcode an epoch ID for predictability in tests (bump if rerunning on devnet)
-  const epochId = new BN(1030); // bump if Devnet complains about reused PDAs
+  const epochId = new BN(1035); // bump if Devnet complains about reused PDAs
   const sessionKey = Keypair.generate();
   const validUntil = Math.floor(Date.now() / 1000) + 3600; // 1 hour from now
 
